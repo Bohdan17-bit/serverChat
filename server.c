@@ -11,6 +11,7 @@
 #include <pthread.h>
 
 #define MAX_CLIENTS_CHAT   8
+#define MAX_SIZE_COMMAND   16
 #define MAX_QUEUE_LENGTH   16
 #define MAX_SIZE_USERNAME  32
 #define SMALL_BUFFER_SIZE  64
@@ -41,6 +42,7 @@ struct session {
 
 void session_send_message(struct thread_start_data *data, struct session *sess, char *response);
 void session_login(struct thread_start_data *data, struct session *sess, char *response);
+
 void error_message() {
     printf("Something was wrong! %s\n", strerror(errno));
 }
@@ -133,6 +135,50 @@ void session_login(struct thread_start_data *data, struct session *sess, char *r
    pthread_mutex_unlock(data->users_mutex);
 }
 
+void kick_user(int socket) {
+   char message[] = "You were disconnected by admin\n";
+   send(socket, message, strlen(message), 0);
+   close(socket);
+}
+
+void *admin_thread(void *data) {
+   struct thread_start_data *clients = data;
+   pthread_mutex_t *users_mutex = clients->users_mutex;
+   // mark server as active to track stopping by admin
+   int server_is_active = 1;
+   char command[MAX_SIZE_COMMAND] = {0};
+   while(server_is_active) {
+      if(scanf("%[^\n]%*c", command) == 1) {
+         // here we check if it a command
+         if(command[0] != '-') {
+            printf("The command should start from '-'\n");
+         }
+         else {
+            if(strstr(command, "-kick ") == NULL) {
+               printf("this command was not found!\n");
+               }
+            else {
+               char *user_to_delete = command + 6;
+               // 6 symbol to right to cut off username
+               pthread_mutex_lock(users_mutex);
+               for(int i = 0; i < MAX_CLIENTS_CHAT; i++) {
+               // trying to find username in list to delete 
+               if(strcmp(clients->usernames[i], user_to_delete) == 0) {             
+                  kick_user(clients->sockets[i]);
+                  printf("User %s was deleted from chat\n", clients->usernames[i]);
+                  clients->sockets[i] = 0;
+                  memset(clients->usernames[i], 0, sizeof(clients->usernames[i]));
+                  }
+               }
+               pthread_mutex_unlock(users_mutex);
+               }
+            }
+      }  
+      memset(command, 0, sizeof(command));   
+   }
+   return NULL;
+}
+
 void *worker_thread(void *data) {
    struct thread_start_data *clients = data;
    char buffer[MAX_SIZE_MESSAGE];
@@ -155,17 +201,16 @@ void *worker_thread(void *data) {
       printf("Received message from socket: %d : %s\n", user_session->unique_socket, buffer);
       session_fsm_step(data, user_session, buffer);
    }
-   
-   close(user_session->unique_socket);
    user_session->state = fsm_name;
    pthread_mutex_lock(users_mutex);
    for(int i = 0; i < MAX_CLIENTS_CHAT; i++) {
       if(user_session->unique_socket == clients->sockets[i]) {
          clients->sockets[i] = 0;
-         memset(clients->usernames[i], 0, sizeof(MAX_SIZE_USERNAME));
+         memset(clients->usernames[i], 0, sizeof(clients->usernames[i]));
          break;
       }
    }
+   close(user_session->unique_socket);
    pthread_mutex_unlock(users_mutex);
    printf("Client on socket %d disconnected\n", user_session->unique_socket);
 
@@ -243,6 +288,10 @@ int main() {
    data.sockets = sockets;
    data.users_mutex = &clients_mutex;
    
+   pthread_t admin;
+   pthread_create(&admin, NULL, admin_thread, &data);
+   pthread_detach(admin);
+
    while(1) {
       int socket_client;
       socklen_t slen = sizeof(client_addr);
